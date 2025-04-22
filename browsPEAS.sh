@@ -57,7 +57,6 @@ list_browsers() {
 }
 
 parse_args() {
-  # Show help if no arguments provided
   if [[ $# -eq 0 ]]; then
     usage
   fi
@@ -95,70 +94,65 @@ init_paths() {
 
   HISTORY_FILE="$OUT_DIR/history.txt"
   BOOKMARKS_FILE="$OUT_DIR/bookmarks.txt"
-  HOSTS_FILE="$OUT_DIR/hosts.txt"
-  PARAMS_FILE="$OUT_DIR/params.txt"
-  PRETTY_SECRETS="$OUT_DIR/secrets_styled.txt"
+  PARAMS_FILE="$OUT_DIR/parameters.txt"
+  PRETTY_SECRETS="$OUT_DIR/sensitive_params.txt"
 
-  touch "$HISTORY_FILE" "$BOOKMARKS_FILE" "$HOSTS_FILE" "$PARAMS_FILE" "$PRETTY_SECRETS"
+  touch "$HISTORY_FILE" "$BOOKMARKS_FILE" "$PARAMS_FILE" "$PRETTY_SECRETS"
   echo -e "${GREEN}[+] Output directory created: $OUT_DIR${RESET}"
 }
 
 declare -A seen_blocks=()
-output=""
+declare -A seen_urls=()
+declare -A seen_params=()
+
 scrape_and_extract() {
-  TEMP_RAW=$(mktemp)
   echo -e "${GREEN}[+] Scanning selected browsers...${RESET}"
 
   for name in "${SELECTED[@]}"; do
     DIR="${BROWSER_PATHS[$name]}"
-    if [[ -d "$DIR" ]]; then
-      echo -e "${YELLOW}  -> Scanning $name (${DIR})${RESET}"
-      find "$DIR" -type f -exec strings {} \; 2>/dev/null >> "$TEMP_RAW"
+    if [[ ! -d "$DIR" ]]; then
+      continue
     fi
+    
+    echo -e "${YELLOW}  -> Scanning $name (${DIR})${RESET}"
+    while IFS= read -r line; do
+      # Skip if we've seen this URL before
+      [[ -n "${seen_urls[$line]:-}" ]] && continue
+      seen_urls[$line]=1
+      
+      # Process URLs with parameters
+      if [[ "$line" == *\?* ]]; then
+        echo "$line" >> "$PARAMS_FILE"
+        
+        if [[ "$line" =~ .*(username|password|token).* ]]; then
+          url="${line%%\?*}"
+          query="${line#*\?}"
+          block="endpoint: $url"$'\n'
+          
+          IFS='&' read -ra parts <<< "$query"
+          for part in "${parts[@]}"; do
+            [[ "$part" != *=* ]] && continue
+            key="${part%%=*}"
+            val="${part#*=}"
+            
+            # Using existing grep pattern for sensitive params
+            if [[ "$key" =~ ^(username|user|user_id|userid|password|pass|pwd|passwd|email|mail|token|access_token|refresh_token|jwt|api_key|session_id|sessionid|sessid|PHPSESSID|JSESSIONID|auth|auth_token|auth_key|authcode|otp|mfa_token|verification_code|remember_me|stay_logged_in|name|first_name|last_name|full_name|address|street|city|zip|postal_code|phone|mobile|telephone|ssn|social_security|national_id|dob|birth_date|age|credit_card|cc_number|cvv|expiry_date|bank_account|iban|swift_code|admin|is_admin|role|privilege|superuser|debug|test_mode|env|environment|secret|secret_key|private_key|encryption_key|config|settings|db_config|csrf_token|csrf|xsrf_token|redirect|return_url|next|callback|query|search|q|filter|id|uid|record_id|document_id|table|db|database|collection|limit|offset|page|count|api|endpoint|method|action|sql|query_string|command|file|filename|file_path|upload|dir|directory|path|location|download|export|import|attachment|document|image|invoice|order_id|transaction_id|amount|price|total|quantity|discount|coupon|promo_code|account_id|customer_id|client_id|url|uri|link|src|dest|referer|referrer|origin|user_agent|ua|device_id|ip|client_ip|remote_addr|PHP_SESSION|REQUEST_METHOD|VIEWSTATE|EVENTVALIDATION|ASP\.NET_SessionId|_method|authenticity_token|csrftoken|_token|XSRF-TOKEN|debug|test|dev|stage|show_errors|display_errors|error_reporting|dump|var_dump|console\.log|verbose|trace|stack_trace|hash|md5|sha1|hmac|license|serial|activation_key|captcha|recaptcha_token).* ]]; then
+              block+="$key => $val"$'\n'
+            fi
+          done
+          
+          # Store unique blocks
+          if [[ -n "$block" && -z "${seen_blocks[$block]:-}" ]]; then
+            seen_blocks[$block]=1
+            echo "$block" >> "$PRETTY_SECRETS"
+          fi
+        fi
+      fi
+    done < <(find "$DIR" -type f -exec strings {} \; 2>/dev/null | grep -Eo 'https?://[^"<> ]+')
   done
 
-  # Extract and filter URLs
-  grep -Eo 'https?://[^"<> ]+' "$TEMP_RAW" | sort -u > "$TEMP_RAW.urls"
-  echo -e "${GREEN}[+] Extracted URLs:${RESET}"
-  cat "$TEMP_RAW.urls"
-
-  # Extract and filter endpoints with query parameters
-  grep -Eo 'https?://[^ ]+\?[^\s"'\''<>]+' "$TEMP_RAW.urls" | sort -u > "$PARAMS_FILE"
-  echo -e "${GREEN}[+] Extracted endpoints with query parameters:${RESET}"
-  cat "$PARAMS_FILE"
-
-  # Extract sensitive information from URLs
-  grep -iE 'https?://[^ ]*(password|token|secret|apikey|key|jwt)=[^ &"'\''<>]+' "$TEMP_RAW.urls" \
-    | sort -u > "$TEMP_RAW.secrets" || touch "$TEMP_RAW.secrets"
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" != *\?* ]] && continue
-
-    url="${line%%\?*}"
-    query="${line#*\?}"
-    block="endpoint: $url"$'\n'
-
-    IFS='&' read -ra parts <<< "$query"
-    for part in "${parts[@]}"; do
-      [[ "$part" != *=* ]] && continue
-      key="${part%%=*}"
-      val="${part#*=}"
-      val="${val%%http*}"
-
-      if [[ "$key" =~ ^(username|user|user_id|userid|password|pass|pwd|passwd|email|mail|token|access_token|refresh_token|jwt)$ ]]; then
-        block+="$key => $val"$'\n'
-      fi
-    done
-
-    if [[ -n "$block" ]] && [[ -z "${seen_blocks[$block]:-}" ]]; then
-      seen_blocks[$block]=1
-      output+="$block"$'\n'
-    fi
-  done < "$TEMP_RAW.secrets"
-
-  echo "$output" > "$PRETTY_SECRETS"
-
-  rm -f "$TEMP_RAW" "$TEMP_RAW.urls" "$TEMP_RAW.secrets"
+  echo -e "${GREEN}[+] Found $(wc -l < "$PARAMS_FILE") unique parameters${RESET}"
+  echo -e "${GREEN}[+] Found $(wc -l < "$PRETTY_SECRETS") sensitive parameters${RESET}"
 }
 
 get_firefox_places_files() {
@@ -210,31 +204,54 @@ extract_bookmarks() {
     fi
   done
 
-  # Nettoyage et tri final
   sort -u "$BOOKMARKS_FILE" -o "$BOOKMARKS_FILE"
   echo -e "${GREEN}[+] Bookmark extraction complete! Saved in: $BOOKMARKS_FILE${RESET}"
 }
 
-
-
 extract_history() {
   echo -e "${GREEN}[+] Extracting browsing history...${RESET}"
+  
+  > "$HISTORY_FILE"
+  
   for name in "${SELECTED[@]}"; do
     DIR="${BROWSER_PATHS[$name]}"
-    if [[ -d "$DIR" ]]; then
-      if command -v sqlite3 >/dev/null 2>&1; then
-        find "$DIR" -name "History" -o -name "places.sqlite" 2>/dev/null | while read -r DB; do
-          echo -e "${YELLOW}  -> Parsing DB: $DB${RESET}"
-          sqlite3 "$DB" "SELECT url FROM urls;" 2>/dev/null
-          sqlite3 "$DB" "SELECT url FROM moz_places;" 2>/dev/null
-        done
-      else
-        echo -e "${RED}[!] sqlite3 not found. Fallback...${RESET}"
-        find "$DIR" -type f \( -name "*.sqlite" -o -name "*.json" \) -exec strings {} \; \
-          | grep -Eo 'https?://[^"<> ]+'
-      fi
+    if [[ ! -d "$DIR" ]]; then
+      continue
     fi
-  done | sort -u >> "$HISTORY_FILE"
+    
+    echo -e "${YELLOW}  -> Processing $name history...${RESET}"
+    
+    if [[ "$name" == "firefox" ]]; then
+      find "$DIR" -type f -name "places.sqlite" 2>/dev/null | while read -r db; do
+        if [[ -f "$db" ]]; then
+          TEMP_DB=$(mktemp --suffix=.sqlite)
+          cp "$db" "$TEMP_DB"
+          
+          sqlite3 "$TEMP_DB" "SELECT url FROM moz_places WHERE url LIKE 'http%';" 2>/dev/null >> "$HISTORY_FILE"
+          rm -f "$TEMP_DB"
+        fi
+      done
+    else
+      # Chrome-based browsers
+      find "$DIR" -type f -name "History" 2>/dev/null | while read -r db; do
+        if [[ -f "$db" ]]; then
+          TEMP_DB=$(mktemp --suffix=.sqlite)
+          cp "$db" "$TEMP_DB"
+          
+          sqlite3 "$TEMP_DB" "SELECT url FROM urls WHERE url LIKE 'http%';" 2>/dev/null >> "$HISTORY_FILE"
+          rm -f "$TEMP_DB"
+        fi
+      done
+    fi
+  done
+
+  # Clean up and deduplicate
+  if [[ -f "$HISTORY_FILE" ]]; then
+    sort -u "$HISTORY_FILE" -o "$HISTORY_FILE"
+    echo -e "${GREEN}[+] History extraction complete! Saved in: $HISTORY_FILE${RESET}"
+  else
+    echo -e "${RED}[!] No history entries found${RESET}"
+  fi
 }
 
 summary() {
@@ -245,10 +262,8 @@ summary() {
 
 banner
 detect_browsers
-SELECTED=()  # Initialize empty by default
-parse_args "$@"  # Will show help if no args provided
-
-# Only continue if browsers were selected
+SELECTED=() 
+parse_args "$@" 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${DETECTED[@]}")
 fi
@@ -258,5 +273,3 @@ scrape_and_extract
 extract_bookmarks
 extract_history
 summary
-
-cat $OUT_DIR${RESET}/bookmarks.txt
